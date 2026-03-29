@@ -10,8 +10,8 @@ Usage:
 """
 
 import torch
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
-from transformers import AdamW
 
 from data import AGNewsDataset, subject_contribution_stats
 from model import get_model, get_tokenizer
@@ -21,7 +21,11 @@ from mia import run_mia
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
 LR = 2e-5
 BATCH_SIZE = 16
 EPOCHS = 3
