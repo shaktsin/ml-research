@@ -10,6 +10,7 @@ Usage:
 """
 
 import torch
+import argparse
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 
@@ -30,41 +31,54 @@ LR = 2e-5
 BATCH_SIZE = 16
 EPOCHS = 3
 CLIP_NORM = 1.0
-BASE_SIGMA = 1.0
+BASE_SIGMA = 0.05
 N_SUBJECTS = 500
 # Limit samples for quick runs — set to None to use full dataset
 MAX_TRAIN = 2000
 MAX_TEST = 500
 
 
-def make_loaders(tokenizer):
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run AG News baseline and subject-DP experiments.")
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--clip-norm", type=float, default=CLIP_NORM)
+    parser.add_argument("--base-sigma", type=float, default=BASE_SIGMA)
+    parser.add_argument("--n-subjects", type=int, default=N_SUBJECTS)
+    parser.add_argument("--max-train", type=int, default=MAX_TRAIN)
+    parser.add_argument("--max-test", type=int, default=MAX_TEST)
+    return parser.parse_args()
+
+
+def make_loaders(tokenizer, args):
     print("Loading AG News dataset...")
-    train_ds = AGNewsDataset("train", tokenizer, n_subjects=N_SUBJECTS)
-    test_ds = AGNewsDataset("test", tokenizer, n_subjects=N_SUBJECTS)
+    train_ds = AGNewsDataset("train", tokenizer, n_subjects=args.n_subjects)
+    test_ds = AGNewsDataset("test", tokenizer, n_subjects=args.n_subjects)
 
-    if MAX_TRAIN:
-        train_ds = Subset(train_ds, range(MAX_TRAIN))
-    if MAX_TEST:
-        test_ds = Subset(test_ds, range(MAX_TEST))
+    if args.max_train:
+        train_ds = Subset(train_ds, range(args.max_train))
+    if args.max_test:
+        test_ds = Subset(test_ds, range(args.max_test))
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size)
     # Small fixed subset for MIA evaluation (balanced member/non-member)
-    mia_train_loader = DataLoader(Subset(train_ds, range(200)), batch_size=BATCH_SIZE)
-    mia_test_loader = DataLoader(Subset(test_ds, range(200)), batch_size=BATCH_SIZE)
+    mia_train_loader = DataLoader(Subset(train_ds, range(200)), batch_size=args.batch_size)
+    mia_test_loader = DataLoader(Subset(test_ds, range(200)), batch_size=args.batch_size)
     return train_loader, test_loader, mia_train_loader, mia_test_loader
 
 
 def run_config(name: str, train_fn, train_loader, test_loader,
-               mia_train_loader, mia_test_loader, tokenizer):
+               mia_train_loader, mia_test_loader, args):
     print(f"\n{'='*60}")
     print(f"  Config: {name}")
     print(f"{'='*60}")
 
     model = get_model(num_labels=4).to(DEVICE)
-    optimizer = AdamW(model.parameters(), lr=LR)
+    optimizer = AdamW(model.parameters(), lr=args.lr)
 
-    train_fn(model, train_loader, optimizer, DEVICE, EPOCHS)
+    train_fn(model, train_loader, optimizer, DEVICE, args.epochs)
 
     acc = evaluate(model, test_loader, DEVICE)
     mia_auc = run_mia(model, mia_train_loader, mia_test_loader, DEVICE)
@@ -77,9 +91,16 @@ def run_config(name: str, train_fn, train_loader, test_loader,
 
 
 def main():
+    args = parse_args()
     print(f"Device: {DEVICE}")
+    print(
+        "Config: "
+        f"lr={args.lr}, batch_size={args.batch_size}, epochs={args.epochs}, "
+        f"clip_norm={args.clip_norm}, base_sigma={args.base_sigma}, "
+        f"max_train={args.max_train}, max_test={args.max_test}"
+    )
     tokenizer = get_tokenizer()
-    train_loader, test_loader, mia_train, mia_test = make_loaders(tokenizer)
+    train_loader, test_loader, mia_train, mia_test = make_loaders(tokenizer, args)
 
     results = []
 
@@ -91,7 +112,7 @@ def main():
         test_loader=test_loader,
         mia_train_loader=mia_train,
         mia_test_loader=mia_test,
-        tokenizer=tokenizer,
+        args=args,
     ))
 
     # 2. Subject-level DP — uniform noise
@@ -99,13 +120,13 @@ def main():
         name="Subject-DP (uniform noise)",
         train_fn=lambda m, tl, opt, dev, ep: train_subject_dp(
             m, tl, opt, dev, ep,
-            clip_norm=CLIP_NORM, base_sigma=BASE_SIGMA, adaptive=False
+            clip_norm=args.clip_norm, base_sigma=args.base_sigma, adaptive=False
         ),
         train_loader=train_loader,
         test_loader=test_loader,
         mia_train_loader=mia_train,
         mia_test_loader=mia_test,
-        tokenizer=tokenizer,
+        args=args,
     ))
 
     # 3. Adaptive subject-level DP — proposed method
@@ -113,13 +134,13 @@ def main():
         name="Adaptive Subject-DP (proposed)",
         train_fn=lambda m, tl, opt, dev, ep: train_subject_dp(
             m, tl, opt, dev, ep,
-            clip_norm=CLIP_NORM, base_sigma=BASE_SIGMA, adaptive=True
+            clip_norm=args.clip_norm, base_sigma=args.base_sigma, adaptive=True
         ),
         train_loader=train_loader,
         test_loader=test_loader,
         mia_train_loader=mia_train,
         mia_test_loader=mia_test,
-        tokenizer=tokenizer,
+        args=args,
     ))
 
     # ---------------------------------------------------------------------------

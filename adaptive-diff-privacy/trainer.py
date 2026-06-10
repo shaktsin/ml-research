@@ -20,12 +20,13 @@ from tqdm import tqdm
 # Gradient utilities
 # ---------------------------------------------------------------------------
 
-def clip_gradient(grad: torch.Tensor, clip_norm: float) -> torch.Tensor:
-    """Clip a gradient tensor to L2 norm <= clip_norm (equation 2 in paper)."""
-    norm = grad.norm(2)
-    if norm > clip_norm:
-        grad = grad * (clip_norm / (norm + 1e-8))
-    return grad
+def clip_subject_gradient(grads: dict[str, torch.Tensor], clip_norm: float) -> dict[str, torch.Tensor]:
+    """Clip the full subject gradient to L2 norm <= clip_norm."""
+    total_norm = torch.sqrt(
+        sum(grad.pow(2).sum() for grad in grads.values())
+    )
+    scale = torch.clamp(clip_norm / (total_norm + 1e-8), max=1.0)
+    return {name: grad * scale for name, grad in grads.items()}
 
 
 def adaptive_noise_scale(base_sigma: float, n_samples: int) -> float:
@@ -65,8 +66,9 @@ def train_subject_dp(model, train_loader, optimizer, device, epochs,
       1. Compute per-sample gradients
       2. Group by subject_id → average within subject
       3. Clip subject gradient
-      4. Add noise (uniform or adaptive depending on `adaptive` flag)
-      5. Average across subjects → apply update
+      4. Sum clipped subject gradients
+      5. Add one noise tensor to the summed gradient
+      6. Average across subjects → apply update
     """
     model.train()
     loss_fn = nn.CrossEntropyLoss(reduction="none")
@@ -109,7 +111,8 @@ def train_subject_dp(model, train_loader, optimizer, device, epochs,
             optimizer.zero_grad()
 
             n_subjects = len(per_sample_grads)
-            accumulated = {}  # param_name -> accumulated noised gradient
+            accumulated = {}  # param_name -> accumulated clipped gradient
+            noise_multipliers = []
 
             for sid, grad_list in per_sample_grads.items():
                 n_samples = len(grad_list)
@@ -121,26 +124,27 @@ def train_subject_dp(model, train_loader, optimizer, device, epochs,
                         [g[name] for g in grad_list]
                     ).mean(dim=0)
 
-                # Clip subject gradient (eq. 2) — applied per-parameter
-                for name in subject_grad:
-                    subject_grad[name] = clip_gradient(subject_grad[name], clip_norm)
+                # Clip the complete subject gradient, not each tensor independently.
+                subject_grad = clip_subject_gradient(subject_grad, clip_norm)
 
-                # Noise scale (eq. 3)
                 sigma = adaptive_noise_scale(base_sigma, n_samples) if adaptive else base_sigma
+                noise_multipliers.append(sigma)
 
-                # Add noise and accumulate
                 for name in subject_grad:
-                    noise = torch.randn_like(subject_grad[name]) * sigma * clip_norm
-                    noised = subject_grad[name] + noise
                     if name not in accumulated:
-                        accumulated[name] = noised
+                        accumulated[name] = subject_grad[name]
                     else:
-                        accumulated[name] += noised
+                        accumulated[name] += subject_grad[name]
 
-            # Average across subjects (eq. 4) and write into .grad
+            # Add one Gaussian noise tensor to the summed gradient, then average.
+            # For adaptive mode, use the RMS multiplier across subjects in the batch.
+            noise_multiplier = math.sqrt(
+                sum(sigma ** 2 for sigma in noise_multipliers) / len(noise_multipliers)
+            )
             for name, param in model.named_parameters():
                 if name in accumulated:
-                    param.grad = accumulated[name] / n_subjects
+                    noise = torch.randn_like(accumulated[name]) * noise_multiplier * clip_norm
+                    param.grad = (accumulated[name] + noise) / n_subjects
 
             optimizer.step()
 
