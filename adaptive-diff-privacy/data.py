@@ -8,6 +8,8 @@ import numpy as np
 from datasets import load_dataset
 from torch.utils.data import Dataset
 
+AG_NEWS_DATASET = "fancyzhx/ag_news"
+
 
 def assign_subject_ids(n_samples: int, n_subjects: int, seed: int = 42) -> np.ndarray:
     """
@@ -24,7 +26,7 @@ def assign_subject_ids(n_samples: int, n_subjects: int, seed: int = 42) -> np.nd
 class AGNewsDataset(Dataset):
     def __init__(self, split: str, tokenizer, max_length: int = 128,
                  n_subjects: int = 500, seed: int = 42):
-        raw = load_dataset("ag_news", split=split)
+        raw = load_dataset(AG_NEWS_DATASET, split=split)
         self.texts = raw["text"]
         self.labels = raw["label"]
         self.subject_ids = assign_subject_ids(len(self.texts), n_subjects, seed)
