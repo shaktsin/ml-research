@@ -14,7 +14,7 @@ import argparse
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 
-from data import AGNewsDataset, subject_contribution_stats
+from data import DATASET_CONFIGS, TextClassificationDataset
 from model import get_model, get_tokenizer
 from trainer import train_baseline, train_subject_dp, evaluate
 from mia import run_mia
@@ -55,7 +55,8 @@ def mia_advantage(raw_auc: float) -> float:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run AG News baseline and subject-DP experiments.")
+    parser = argparse.ArgumentParser(description="Run text classification baseline and subject-DP experiments.")
+    parser.add_argument("--dataset", choices=sorted(DATASET_CONFIGS), default="ag_news")
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
@@ -64,13 +65,18 @@ def parse_args():
     parser.add_argument("--n-subjects", type=int, default=N_SUBJECTS)
     parser.add_argument("--max-train", type=int, default=MAX_TRAIN)
     parser.add_argument("--max-test", type=int, default=MAX_TEST)
+    parser.add_argument("--mia-samples", type=int, default=200)
     return parser.parse_args()
 
 
 def make_loaders(tokenizer, args):
-    print("Loading AG News dataset...")
-    train_ds = AGNewsDataset("train", tokenizer, n_subjects=args.n_subjects)
-    test_ds = AGNewsDataset("test", tokenizer, n_subjects=args.n_subjects)
+    print(f"Loading {args.dataset} dataset...")
+    train_ds = TextClassificationDataset(
+        args.dataset, "train", tokenizer, n_subjects=args.n_subjects
+    )
+    test_ds = TextClassificationDataset(
+        args.dataset, "test", tokenizer, n_subjects=args.n_subjects
+    )
 
     if args.max_train:
         train_ds = Subset(train_ds, range(args.max_train))
@@ -80,8 +86,10 @@ def make_loaders(tokenizer, args):
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size)
     # Small fixed subset for MIA evaluation (balanced member/non-member)
-    mia_train_loader = DataLoader(Subset(train_ds, range(200)), batch_size=args.batch_size)
-    mia_test_loader = DataLoader(Subset(test_ds, range(200)), batch_size=args.batch_size)
+    mia_train_n = min(args.mia_samples, len(train_ds))
+    mia_test_n = min(args.mia_samples, len(test_ds))
+    mia_train_loader = DataLoader(Subset(train_ds, range(mia_train_n)), batch_size=args.batch_size)
+    mia_test_loader = DataLoader(Subset(test_ds, range(mia_test_n)), batch_size=args.batch_size)
     return train_loader, test_loader, mia_train_loader, mia_test_loader
 
 
@@ -91,7 +99,7 @@ def run_config(name: str, train_fn, train_loader, test_loader,
     print(f"  Config: {name}")
     print(f"{'='*60}")
 
-    model = get_model(num_labels=4).to(DEVICE)
+    model = get_model(num_labels=DATASET_CONFIGS[args.dataset]["num_labels"]).to(DEVICE)
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
     train_fn(model, train_loader, optimizer, DEVICE, args.epochs)
@@ -113,7 +121,8 @@ def main():
         "Config: "
         f"lr={args.lr}, batch_size={args.batch_size}, epochs={args.epochs}, "
         f"clip_norm={args.clip_norm}, base_sigma={args.base_sigma}, "
-        f"max_train={args.max_train}, max_test={args.max_test}"
+        f"dataset={args.dataset}, max_train={args.max_train}, "
+        f"max_test={args.max_test}, mia_samples={args.mia_samples}"
     )
     tokenizer = get_tokenizer()
     train_loader, test_loader, mia_train, mia_test = make_loaders(tokenizer, args)
