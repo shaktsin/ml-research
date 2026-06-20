@@ -9,8 +9,13 @@ Usage:
     python run_experiment.py
 """
 
-import torch
 import argparse
+import csv
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Subset
 
@@ -36,6 +41,7 @@ N_SUBJECTS = 500
 # Limit samples for quick runs — set to None to use full dataset
 MAX_TRAIN = 2000
 MAX_TEST = 500
+OUTPUT_DIR = "results"
 
 
 def mia_risk_auc(raw_auc: float) -> float:
@@ -54,6 +60,110 @@ def mia_advantage(raw_auc: float) -> float:
     return 2.0 * (mia_risk_auc(raw_auc) - 0.5)
 
 
+def next_iteration(results_csv: Path) -> int:
+    if not results_csv.exists():
+        return 1
+
+    with results_csv.open("r", newline="") as f:
+        rows = csv.DictReader(f)
+        iterations = [
+            int(row["iteration"])
+            for row in rows
+            if row.get("iteration", "").isdigit()
+        ]
+    return max(iterations, default=0) + 1
+
+
+def build_run_record(args, results, iteration: int) -> dict:
+    baseline, uniform_dp, adaptive_dp = results
+    adaptive_accuracy_delta = adaptive_dp["accuracy"] - baseline["accuracy"]
+    adaptive_vs_uniform_delta = adaptive_dp["accuracy"] - uniform_dp["accuracy"]
+
+    return {
+        "iteration": iteration,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "device": str(DEVICE),
+        "args": vars(args),
+        "results": [
+            {
+                **result,
+                "mia_risk_auc": mia_risk_auc(result["mia_auc"]),
+                "mia_advantage": mia_advantage(result["mia_auc"]),
+            }
+            for result in results
+        ],
+        "takeaway": {
+            "adaptive_accuracy_delta_vs_baseline": adaptive_accuracy_delta,
+            "adaptive_accuracy_delta_vs_uniform_dp": adaptive_vs_uniform_delta,
+            "adaptive_mia_risk_auc": mia_risk_auc(adaptive_dp["mia_auc"]),
+            "adaptive_mia_advantage": mia_advantage(adaptive_dp["mia_auc"]),
+        },
+    }
+
+
+def save_run_record(run_record: dict, output_dir: str) -> tuple[Path, Path]:
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    iteration = run_record["iteration"]
+    json_path = out_dir / f"iteration_{iteration:04d}.json"
+    csv_path = out_dir / "experiment_results.csv"
+
+    with json_path.open("w") as f:
+        json.dump(run_record, f, indent=2)
+
+    fieldnames = [
+        "iteration",
+        "timestamp_utc",
+        "dataset",
+        "base_sigma",
+        "epochs",
+        "max_train",
+        "max_test",
+        "mia_samples",
+        "config",
+        "accuracy",
+        "raw_mia_auc",
+        "mia_risk_auc",
+        "mia_advantage",
+        "adaptive_accuracy_delta_vs_baseline",
+        "adaptive_accuracy_delta_vs_uniform_dp",
+    ]
+    write_header = not csv_path.exists()
+
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+
+        args = run_record["args"]
+        takeaway = run_record["takeaway"]
+        for result in run_record["results"]:
+            writer.writerow({
+                "iteration": iteration,
+                "timestamp_utc": run_record["timestamp_utc"],
+                "dataset": args["dataset"],
+                "base_sigma": args["base_sigma"],
+                "epochs": args["epochs"],
+                "max_train": args["max_train"],
+                "max_test": args["max_test"],
+                "mia_samples": args["mia_samples"],
+                "config": result["config"],
+                "accuracy": result["accuracy"],
+                "raw_mia_auc": result["mia_auc"],
+                "mia_risk_auc": result["mia_risk_auc"],
+                "mia_advantage": result["mia_advantage"],
+                "adaptive_accuracy_delta_vs_baseline": takeaway[
+                    "adaptive_accuracy_delta_vs_baseline"
+                ],
+                "adaptive_accuracy_delta_vs_uniform_dp": takeaway[
+                    "adaptive_accuracy_delta_vs_uniform_dp"
+                ],
+            })
+
+    return json_path, csv_path
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run text classification baseline and subject-DP experiments.")
     parser.add_argument("--dataset", choices=sorted(DATASET_CONFIGS), default="ag_news")
@@ -66,6 +176,7 @@ def parse_args():
     parser.add_argument("--max-train", type=int, default=MAX_TRAIN)
     parser.add_argument("--max-test", type=int, default=MAX_TEST)
     parser.add_argument("--mia-samples", type=int, default=200)
+    parser.add_argument("--output-dir", default=OUTPUT_DIR)
     return parser.parse_args()
 
 
@@ -116,13 +227,16 @@ def run_config(name: str, train_fn, train_loader, test_loader,
 
 def main():
     args = parse_args()
+    output_dir = Path(args.output_dir)
+    iteration = next_iteration(output_dir / "experiment_results.csv")
     print(f"Device: {DEVICE}")
     print(
         "Config: "
         f"lr={args.lr}, batch_size={args.batch_size}, epochs={args.epochs}, "
         f"clip_norm={args.clip_norm}, base_sigma={args.base_sigma}, "
-        f"dataset={args.dataset}, max_train={args.max_train}, "
-        f"max_test={args.max_test}, mia_samples={args.mia_samples}"
+        f"dataset={args.dataset}, iteration={iteration}, "
+        f"max_train={args.max_train}, max_test={args.max_test}, "
+        f"mia_samples={args.mia_samples}, output_dir={args.output_dir}"
     )
     tokenizer = get_tokenizer()
     train_loader, test_loader, mia_train, mia_test = make_loaders(tokenizer, args)
@@ -213,6 +327,13 @@ def main():
     print("    Raw AUC near 0.50 means the attack is close to random guessing.")
     print("    Raw AUC below 0.50 is not better-than-perfect privacy; it means")
     print("    the attack direction is unstable, so MIA Risk reports max(AUC, 1-AUC).")
+
+    run_record = build_run_record(args, results, iteration)
+    json_path, csv_path = save_run_record(run_record, args.output_dir)
+    print()
+    print("  Saved iteration results:")
+    print(f"    JSON: {json_path}")
+    print(f"    CSV : {csv_path}")
 
 
 if __name__ == "__main__":
